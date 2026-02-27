@@ -1,0 +1,4 @@
+python-osc==1.9.3
+numpy==2.2.3
+opencv-python==4.11.0.86
+pygame==2.6.1

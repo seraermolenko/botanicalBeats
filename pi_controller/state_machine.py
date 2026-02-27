@@ -1,0 +1,78 @@
+import asyncio
+import time
+from enum import Enum
+
+from .config import RATES, TIMING
+from .hardware import HardwareIO, PotSnapshot
+from .osc_io import OscBus
+from .sensors import SensorPipeline, derive_params
+
+
+class State(str, Enum):
+    IDLE = "idle"
+    TALKING = "talking"
+    LISTENING = "listening"
+    THANKS = "thanks"
+
+
+class Controller:
+    def __init__(self, hw: HardwareIO, osc: OscBus, sensors: SensorPipeline) -> None:
+        self.hw = hw
+        self.osc = osc
+        self.sensors = sensors
+        self.state = State.IDLE
+        self.frozen = PotSnapshot(0.5, 0.5, 0.5)
+
+    async def run_forever(self) -> None:
+        self.osc.state(State.IDLE.value)
+        while True:
+            await self._run_idle()
+            await self._run_talking()
+            await self._run_listening()
+            await self._run_thanks()
+
+    async def _run_idle(self) -> None:
+        self.state = State.IDLE
+        self.osc.state(self.state.value)
+        sleep_s = 1.0 / RATES.idle_poll_hz
+        while True:
+            pots = self.hw.read_pots()
+            self.hw.apply_idle_controls(pots)
+
+            if self.hw.read_start_button_edge():
+                self.frozen = pots
+                self.osc.frozen(fan=pots.fan, hue=pots.hue, light=pots.light)
+                return
+
+            await asyncio.sleep(sleep_s)
+
+    async def _run_talking(self) -> None:
+        self.state = State.TALKING
+        self.osc.state(self.state.value)
+        self.hw.apply_frozen_controls(self.frozen)
+        await asyncio.sleep(TIMING.talking_seconds)
+
+    async def _run_listening(self) -> None:
+        self.state = State.LISTENING
+        self.osc.state(self.state.value)
+
+        rate = 1.0 / RATES.listening_param_hz
+        end_at = time.monotonic() + TIMING.listening_seconds
+        while time.monotonic() < end_at:
+            frame = self.sensors.read()
+            params = derive_params(frame)
+            self.osc.sensor(frame.motion, frame.rgb)
+            self.osc.params(
+                energy=params["energy"],
+                density=params["density"],
+                sparkle=params["sparkle"],
+                hue=params["hue"],
+            )
+            self.hw.apply_frozen_controls(self.frozen)
+            await asyncio.sleep(rate)
+
+    async def _run_thanks(self) -> None:
+        self.state = State.THANKS
+        self.osc.state(self.state.value)
+        await asyncio.sleep(TIMING.thanks_seconds)
+        self.hw.all_off()
