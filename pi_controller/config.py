@@ -24,13 +24,12 @@ class RateConfig:
 
 @dataclass(frozen=True)
 class HardwareConfig:
-    # Set to True on Raspberry Pi to enable GPIO/I2C hardware paths.
+    # NOTE: Set to True on Raspberry Pi to enable GPIO/I2C hardware paths.\
     use_pi_hardware: bool = False
 
     # GPIO pin map
     fan_pwm_gpio: int = 12
     led_data_gpio: int = 18
-    # Update if your physical start button uses a different GPIO.
     start_button_gpio: int = 23
 
     # I2C addresses
