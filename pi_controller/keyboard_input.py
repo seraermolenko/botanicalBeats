@@ -20,8 +20,8 @@ class KeyboardInput:
     def __init__(self) -> None:
         self._state = KeyboardSnapshot()
         self._step = 0.05
-        self._start_edge = False
-        self._touch_pulse = False
+        self._start_edge_count = 0
+        self._touch_pulse_count = 0
         self._lock = threading.Lock()
         self._running = True
 
@@ -79,11 +79,11 @@ class KeyboardInput:
             elif ch == "d":
                 self._state.light = _clamp01(self._state.light - self._step)
                 changed = True
-            elif ch == "t":
-                self._touch_pulse = True
+            elif ch in ("t", "T"):
+                self._touch_pulse_count += 1
                 print("[keyboard] touch pulse")
             elif ch in ("\n", "\r", " "):
-                self._start_edge = True
+                self._start_edge_count += 1
                 print("[keyboard] start edge (commit values)")
             elif ch == "z":
                 self._state = KeyboardSnapshot()
@@ -108,15 +108,17 @@ class KeyboardInput:
 
     def consume_start_edge(self) -> bool:
         with self._lock:
-            edge = self._start_edge
-            self._start_edge = False
-            return edge
+            if self._start_edge_count > 0:
+                self._start_edge_count -= 1
+                return True
+            return False
 
     def consume_touch_pulse(self) -> bool:
         with self._lock:
-            pulse = self._touch_pulse
-            self._touch_pulse = False
-            return pulse
+            if self._touch_pulse_count > 0:
+                self._touch_pulse_count -= 1
+                return True
+            return False
 
     def cleanup(self) -> None:
         self._running = False
