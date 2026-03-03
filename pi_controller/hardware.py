@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 
 from .config import HARDWARE
+from .keyboard_input import get_keyboard_input
 
 try:
     from gpiozero import Button, PWMOutputDevice  # type: ignore
@@ -43,6 +44,9 @@ class HardwareIO:
 
         env_flag = os.getenv("BOTANICAL_USE_PI_HARDWARE", "0") == "1"
         self._use_pi = HARDWARE.use_pi_hardware or env_flag
+        self._keyboard = get_keyboard_input(
+            enabled=os.getenv("BOTANICAL_USE_KEYBOARD", "0") == "1"
+        )
 
         self._fan = None
         self._led = None
@@ -69,6 +73,11 @@ class HardwareIO:
         self._led = neopixel.NeoPixel(board.D18, 1, auto_write=True)
 
     def read_pots(self) -> PotSnapshot:
+        if self._keyboard is not None:
+            k = self._keyboard.snapshot()
+            self._last = PotSnapshot(fan=k.fan, hue=k.hue, light=k.light)
+            return self._last
+
         if self._pot_fan is not None and self._pot_hue is not None and self._pot_light is not None:
             self._last = PotSnapshot(
                 fan=self._normalize_ads_voltage(self._pot_fan.voltage),
@@ -90,6 +99,9 @@ class HardwareIO:
         return max(0.0, min(1.0, voltage / 3.3))
 
     def read_start_button_edge(self) -> bool:
+        if self._keyboard is not None:
+            return self._keyboard.consume_start_edge()
+
         if self._button is not None:
             current_pressed = self._button.is_pressed
             is_edge = current_pressed and not self._last_button_state
@@ -100,6 +112,11 @@ class HardwareIO:
         if now >= self._next_edge_at:
             self._next_edge_at = now + 20.0
             return True
+        return False
+
+    def read_touch_pulse(self) -> bool:
+        if self._keyboard is not None:
+            return self._keyboard.consume_touch_pulse()
         return False
 
     def apply_idle_controls(self, pots: PotSnapshot) -> None:

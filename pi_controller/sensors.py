@@ -1,7 +1,10 @@
 import math
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
+
+from .keyboard_input import get_keyboard_input
 
 try:
     import cv2  # type: ignore
@@ -96,8 +99,13 @@ class SensorPipeline:
     """Reads camera motion + TCS34725 RGB when available, with simulation fallback."""
 
     def __init__(self) -> None:
+        self._keyboard = get_keyboard_input(
+            enabled=os.getenv("BOTANICAL_USE_KEYBOARD", "0") == "1"
+        )
         self._camera = None
         self._rgb_sensor = None
+        if self._keyboard is not None:
+            return
         if _CAMERA_AVAILABLE:
             try:
                 self._camera = CameraMotionDetector(resolution=(640, 480))
@@ -111,6 +119,11 @@ class SensorPipeline:
                 self._rgb_sensor = None
 
     def read(self) -> SensorFrame:
+        if self._keyboard is not None:
+            k = self._keyboard.snapshot()
+            rgb = _hsv01_to_rgb01(k.hue, 1.0, k.light)
+            return SensorFrame(motion=0.0, rgb=rgb)
+
         t = time.monotonic()
         motion = self._read_motion(t)
         r, g, b = self._read_rgb(t)
@@ -155,3 +168,10 @@ def derive_params(frame: SensorFrame) -> dict[str, float]:
         "sparkle": sparkle,
         "hue": hue,
     }
+
+
+def _hsv01_to_rgb01(h: float, s: float, v: float) -> tuple[float, float, float]:
+    import colorsys
+
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return r, g, b

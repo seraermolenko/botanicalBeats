@@ -26,6 +26,9 @@ class OscBus:
         self._sp.send_message("/sensor/motion", motion)
         self._sp.send_message("/sensor/rgb", [r, g, b])
 
+    def touch(self) -> None:
+        self._sp.send_message("/sensor/touch", 1)
+
     def params(self, energy: float, density: float, sparkle: float, hue: float) -> None:
         self._sp.send_message("/param/energy", energy)
         self._sp.send_message("/param/density", density)
