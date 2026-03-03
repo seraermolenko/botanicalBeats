@@ -28,6 +28,8 @@ class OscBus:
 
     def touch(self) -> None:
         self._sp.send_message("/sensor/touch", 1)
+        # Direct visual fallback so touch always yields a burst even if Sonic Pi cue forwarding is delayed.
+        self._viz.send_message("/cue/snare", [0, 0, 1.0])
 
     def params(self, energy: float, density: float, sparkle: float, hue: float) -> None:
         self._sp.send_message("/param/energy", energy)

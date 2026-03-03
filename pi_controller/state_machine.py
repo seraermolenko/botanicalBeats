@@ -36,13 +36,17 @@ class Controller:
         self.osc.state(self.state.value)
         print("[controller] state=idle (waiting for start)")
         sleep_s = 1.0 / RATES.idle_poll_hz
+        last_state_send = time.monotonic()
         while True:
             pots = self.hw.read_pots()
             self.hw.apply_idle_controls(pots)
 
-            if self.hw.read_touch_pulse():
-                self.osc.touch()
-                print("[controller] touch pulse -> /sensor/touch")
+            self._emit_touch_pulses()
+
+            now = time.monotonic()
+            if (now - last_state_send) >= 1.0:
+                self.osc.state(self.state.value)
+                last_state_send = now
 
             if self.hw.read_start_button_edge():
                 self.frozen = pots
@@ -59,7 +63,10 @@ class Controller:
         self.osc.state(self.state.value)
         print("[controller] state=talking")
         self.hw.apply_frozen_controls(self.frozen)
-        await asyncio.sleep(TIMING.talking_seconds)
+        end_at = time.monotonic() + TIMING.talking_seconds
+        while time.monotonic() < end_at:
+            self._emit_touch_pulses()
+            await asyncio.sleep(0.03)
 
     async def _run_listening(self) -> None:
         self.state = State.LISTENING
@@ -68,7 +75,9 @@ class Controller:
 
         rate = 1.0 / RATES.listening_param_hz
         end_at = time.monotonic() + TIMING.listening_seconds
+        last_state_send = time.monotonic()
         while time.monotonic() < end_at:
+            self._emit_touch_pulses()
             frame = self.sensors.read()
             params = derive_params(frame)
             self.osc.sensor(frame.motion, frame.rgb)
@@ -78,6 +87,10 @@ class Controller:
                 sparkle=params["sparkle"],
                 hue=params["hue"],
             )
+            now = time.monotonic()
+            if (now - last_state_send) >= 1.0:
+                self.osc.state(self.state.value)
+                last_state_send = now
             self.hw.apply_frozen_controls(self.frozen)
             await asyncio.sleep(rate)
 
@@ -85,5 +98,16 @@ class Controller:
         self.state = State.THANKS
         self.osc.state(self.state.value)
         print("[controller] state=thanks")
-        await asyncio.sleep(TIMING.thanks_seconds)
+        end_at = time.monotonic() + TIMING.thanks_seconds
+        while time.monotonic() < end_at:
+            self._emit_touch_pulses()
+            await asyncio.sleep(0.03)
         self.hw.all_off()
+
+    def _emit_touch_pulses(self) -> None:
+        sent = 0
+        while self.hw.read_touch_pulse():
+            self.osc.touch()
+            sent += 1
+        if sent > 0:
+            print(f"[controller] touch pulse -> /sensor/touch x{sent}")
