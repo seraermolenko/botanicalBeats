@@ -37,9 +37,9 @@ Update in `docs/osc_contract.md` and `pi_controller/config.py` as needed.
 ## Run order
 
 1. Start visualizer:
-   - `python3 visualizer/main.py`
+   - `python -m visualizer.main`
 2. Start Pi controller:
-   - `python3 pi_controller/main.py`
+   - `python -m pi_controller.main`
 3. Start Sonic Pi and paste/run `sonic_pi/botanical_beats.rb`
 
 ## Notes
@@ -51,6 +51,22 @@ Update in `docs/osc_contract.md` and `pi_controller/config.py` as needed.
 - Start button defaults to `GPIO23`; change in `pi_controller/config.py` if needed.
 - Enable real Pi hardware mode with:
   - `export BOTANICAL_USE_PI_HARDWARE=1`
+
+## Keyboard testing mode (no hardware)
+
+Enable keyboard-driven test input:
+
+- `export BOTANICAL_USE_KEYBOARD=1`
+- `python3 -m pi_controller.main`
+
+Controls:
+
+- Wind strength (fan): `q` up, `a` down
+- Color (hue): `w` up, `s` down
+- Color intensity (light): `e` up, `d` down
+- Touch pulse (snare trigger): `t` (independent of start/send)
+- Start/send (button edge): `Enter` (or `space`)
+- Reset all values to defaults: `z`
 
 ## Raspberry Pi camera deps
 

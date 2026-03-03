@@ -34,14 +34,22 @@ class Controller:
     async def _run_idle(self) -> None:
         self.state = State.IDLE
         self.osc.state(self.state.value)
+        print("[controller] state=idle (waiting for start)")
         sleep_s = 1.0 / RATES.idle_poll_hz
         while True:
             pots = self.hw.read_pots()
             self.hw.apply_idle_controls(pots)
 
+            if self.hw.read_touch_pulse():
+                self.osc.touch()
+                print("[controller] touch pulse -> /sensor/touch")
+
             if self.hw.read_start_button_edge():
                 self.frozen = pots
                 self.osc.frozen(fan=pots.fan, hue=pots.hue, light=pots.light)
+                print(
+                    f"[controller] start edge -> frozen fan={pots.fan:.2f} hue={pots.hue:.2f} light={pots.light:.2f}"
+                )
                 return
 
             await asyncio.sleep(sleep_s)
@@ -49,12 +57,14 @@ class Controller:
     async def _run_talking(self) -> None:
         self.state = State.TALKING
         self.osc.state(self.state.value)
+        print("[controller] state=talking")
         self.hw.apply_frozen_controls(self.frozen)
         await asyncio.sleep(TIMING.talking_seconds)
 
     async def _run_listening(self) -> None:
         self.state = State.LISTENING
         self.osc.state(self.state.value)
+        print("[controller] state=listening")
 
         rate = 1.0 / RATES.listening_param_hz
         end_at = time.monotonic() + TIMING.listening_seconds
@@ -74,5 +84,6 @@ class Controller:
     async def _run_thanks(self) -> None:
         self.state = State.THANKS
         self.osc.state(self.state.value)
+        print("[controller] state=thanks")
         await asyncio.sleep(TIMING.thanks_seconds)
         self.hw.all_off()

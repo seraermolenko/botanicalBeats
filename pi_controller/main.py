@@ -1,6 +1,7 @@
 import asyncio
 
 from pi_controller.hardware import HardwareIO
+from pi_controller.keyboard_input import cleanup_keyboard_input
 from pi_controller.osc_io import OscBus
 from pi_controller.sensors import SensorPipeline
 from pi_controller.state_machine import Controller
@@ -16,6 +17,7 @@ async def _main() -> None:
     finally:
         hw.cleanup()
         sensors.cleanup()
+        cleanup_keyboard_input()
 
 
 if __name__ == "__main__":
