@@ -96,9 +96,10 @@ class CameraMotionDetector:
 
 
 class SensorPipeline:
-    """Reads camera motion + TCS34725 RGB when available, with simulation fallback."""
+    """Reads camera motion + TCS34725 RGB when available, with pot-value fallback."""
 
-    def __init__(self) -> None:
+    def __init__(self, hw=None) -> None:
+        self._hw = hw
         self._keyboard = get_keyboard_input(
             enabled=os.getenv("BOTANICAL_USE_KEYBOARD", "0") == "1"
         )
@@ -135,6 +136,8 @@ class SensorPipeline:
                 return self._camera.read_motion_normalized()
             except Exception:
                 pass
+        if self._hw is not None:
+            return self._hw.last_pots.fan
         return (math.sin(t * 1.1) + 1.0) * 0.5
 
     def _read_rgb(self, t: float) -> tuple[float, float, float]:
@@ -144,6 +147,9 @@ class SensorPipeline:
                 return r / 255.0, g / 255.0, b / 255.0
             except Exception:
                 pass
+        if self._hw is not None:
+            pots = self._hw.last_pots
+            return _hsv01_to_rgb01(pots.hue, 1.0, pots.light)
         return (
             (math.sin(t * 0.7) + 1.0) * 0.5,
             (math.sin(t * 0.9 + 1.0) + 1.0) * 0.5,

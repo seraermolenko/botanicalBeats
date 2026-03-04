@@ -25,7 +25,7 @@ class RateConfig:
 @dataclass(frozen=True)
 class HardwareConfig:
     # NOTE: Set to True on Raspberry Pi to enable GPIO/I2C hardware paths.\
-    use_pi_hardware: bool = False
+    use_pi_hardware: bool = True
 
     # GPIO pin map
     fan_pwm_gpio: int = 12

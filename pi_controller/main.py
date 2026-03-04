@@ -10,7 +10,7 @@ from pi_controller.state_machine import Controller
 async def _main() -> None:
     print("[controller] running, sera is cool...")
     hw = HardwareIO()
-    sensors = SensorPipeline()
+    sensors = SensorPipeline(hw=hw)
     controller = Controller(hw=hw, osc=OscBus(), sensors=sensors)
     try:
         await controller.run_forever()

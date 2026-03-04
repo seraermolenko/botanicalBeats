@@ -65,7 +65,6 @@ class Controller:
         self.hw.apply_frozen_controls(self.frozen)
         end_at = time.monotonic() + TIMING.talking_seconds
         while time.monotonic() < end_at:
-            self._emit_touch_pulses()
             await asyncio.sleep(0.03)
 
     async def _run_listening(self) -> None:
@@ -77,7 +76,6 @@ class Controller:
         end_at = time.monotonic() + TIMING.listening_seconds
         last_state_send = time.monotonic()
         while time.monotonic() < end_at:
-            self._emit_touch_pulses()
             frame = self.sensors.read()
             params = derive_params(frame)
             self.osc.sensor(frame.motion, frame.rgb)
@@ -100,7 +98,6 @@ class Controller:
         print("[controller] state=thanks")
         end_at = time.monotonic() + TIMING.thanks_seconds
         while time.monotonic() < end_at:
-            self._emit_touch_pulses()
             await asyncio.sleep(0.03)
         self.hw.all_off()
 
