@@ -8,23 +8,28 @@ from .keyboard_input import get_keyboard_input
 
 try:
     from gpiozero import Button, PWMOutputDevice  # type: ignore
-
     import board  # type: ignore
     import busio  # type: ignore
-    import neopixel  # type: ignore
     import adafruit_ads1x15.ads1115 as ADS  # type: ignore
     from adafruit_ads1x15.analog_in import AnalogIn  # type: ignore
-
     _PI_HW_AVAILABLE = True
-except Exception:
+except Exception as e:
+    print(f"[hardware] Pi hardware unavailable: {e}")
     Button = None
     PWMOutputDevice = None
     board = None
     busio = None
-    neopixel = None
     ADS = None
     AnalogIn = None
     _PI_HW_AVAILABLE = False
+
+try:
+    import neopixel  # type: ignore
+    _NEOPIXEL_AVAILABLE = True
+except Exception as e:
+    print(f"[hardware] NeoPixel unavailable: {e}")
+    neopixel = None
+    _NEOPIXEL_AVAILABLE = False
 
 
 @dataclass
@@ -59,18 +64,41 @@ class HardwareIO:
             self._init_pi_hardware()
 
     def _init_pi_hardware(self) -> None:
-        i2c = busio.I2C(board.SCL, board.SDA)
+        try:
+            i2c = busio.I2C(board.SCL, board.SDA)
+            pots_adc = ADS.ADS1115(i2c)
+            pots_adc.gain = 1
+            self._pot_fan = AnalogIn(pots_adc, 0)
+            self._pot_hue = AnalogIn(pots_adc, 1)
+            self._pot_light = AnalogIn(pots_adc, 2)
+            print("[hardware] pots OK")
+        except Exception as e:
+            print(f"[hardware] pots failed: {e}")
 
-        pots_adc = ADS.ADS1115(i2c, address=HARDWARE.ads1115_pots_addr)
-        self._pot_fan = AnalogIn(pots_adc, ADS.P0)
-        self._pot_hue = AnalogIn(pots_adc, ADS.P1)
-        self._pot_light = AnalogIn(pots_adc, ADS.P2)
+        try:
+            self._button = Button(HARDWARE.start_button_gpio, pull_up=False)
+            print("[hardware] button OK")
+        except Exception as e:
+            print(f"[hardware] button failed: {e}")
 
-        self._button = Button(HARDWARE.start_button_gpio, pull_up=True)
-        self._fan = PWMOutputDevice(HARDWARE.fan_pwm_gpio, frequency=25000)
+        try:
+            self._fan = PWMOutputDevice(HARDWARE.fan_pwm_gpio, frequency=25000)
+            print("[hardware] fan OK")
+        except Exception as e:
+            print(f"[hardware] fan failed: {e}")
 
-        # NeoPixel/WS2812 data on GPIO18
-        self._led = neopixel.NeoPixel(board.D18, 1, auto_write=True)
+        if _NEOPIXEL_AVAILABLE:
+            try:
+                self._led = neopixel.NeoPixel(board.D18, 1, auto_write=True)
+                print("[hardware] LED OK")
+            except Exception as e:
+                print(f"[hardware] LED failed: {e}")
+        else:
+            print("[hardware] LED skipped (NeoPixel unavailable)")
+
+    @property
+    def last_pots(self) -> PotSnapshot:
+        return self._last
 
     def read_pots(self) -> PotSnapshot:
         if self._keyboard is not None:

@@ -6,3 +6,4 @@ adafruit-circuitpython-ads1x15>=2.2.0
 adafruit-circuitpython-tcs34725>=3.3.0
 adafruit-circuitpython-neopixel>=6.3.0
 gpiozero>=2.0.1
+lgpio>=0.2.2
