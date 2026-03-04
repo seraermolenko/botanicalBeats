@@ -14,6 +14,9 @@ class OscBus:
         self._viz.send_message(address, 1)
 
     def frozen(self, fan: float, hue: float, light: float) -> None:
+        fan = max(0.0, min(1.0, float(fan)))
+        hue = max(0.0, min(1.0, float(hue)))
+        light = max(0.0, min(1.0, float(light)))
         self._sp.send_message("/frozen/fan", fan)
         self._sp.send_message("/frozen/hue", hue)
         self._sp.send_message("/frozen/light", light)

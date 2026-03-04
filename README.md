@@ -68,6 +68,25 @@ Controls:
 - Start/send (button edge): `Enter` (or `space`)
 - Reset all values to defaults: `z`
 
+## Visualizer OSC test harness (no Sonic Pi)
+
+Use a manual sender that simulates state changes + cue bursts for visuals.
+
+1. Start visualizer:
+   - `python -m visualizer.main`
+2. In another terminal, start test sender:
+   - `python3 -m visualizer.test_sender`
+3. Press `Enter` to send a full test burst to the visualizer.
+4. Quit sender with `q` + `Enter`.
+
+Optional target override:
+
+- `python3 -m visualizer.test_sender --host 127.0.0.1 --port 9001`
+- Keep listening active for 10s (default shown explicitly):
+  - `python3 -m visualizer.test_sender --listening-seconds 10`
+- Include the bright `THANKS` state:
+  - `python3 -m visualizer.test_sender --with-thanks`
+
 ## Raspberry Pi camera deps
 
 For `picamera2` on Raspberry Pi OS, install via apt:

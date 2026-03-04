@@ -12,7 +12,7 @@ class OscConfig:
 @dataclass(frozen=True)
 class TimingConfig:
     talking_seconds: float = 3.0
-    listening_seconds: float = 10.0
+    listening_seconds: float = 7.0
     thanks_seconds: float = 3.0
 
 

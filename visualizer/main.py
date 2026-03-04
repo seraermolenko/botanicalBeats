@@ -1,94 +1,151 @@
+"""
+Pygame-based visualizer — merged from display.py (rich visuals) + original (full OSC handling).
+
+Three visual modes:
+  IDLE:       Dreamy particle field — glowing dots drift and pulse,
+              color driven by frozen_hue, size/brightness react to audio amplitude.
+              Particle speed driven by frozen_fan.
+  TALKING:    Pulsing green orb — we are talking TO the plant, it listens.
+              Calm, receptive energy.
+  LISTENING:  Pixelated plant character bops and dances in sync with music —
+              the plant is talking back. Beat hits trigger bounce/squish/wiggle.
+
+Special states:
+  THANKS:     Warm flash + "THANK YOU!" + mood-engine plant emotion sentence.
+              Auto-transitions back to idle after 10s.
+  (fallback): Phase name displayed centered on hue-tinted background.
+
+OSC addresses handled:
+  /state/idle        → IDLE
+  /state/talking     → TALKING  (we speak to the plant → orb)
+  /state/listening   → LISTENING (plant speaks back → dancing pixel plant)
+  /state/listenting  → LISTENTING (radial audio analyzer)
+  /state/thanks      → THANKS → idle
+
+  /viz/mod/hue       → float 0-1, LED hue accent
+  /viz/mod/energy    → float 0-1, general energy
+  /viz/audio/pulse   → float 0-1, audio amplitude
+  /frozen/hue        → float 0-1, ambient hue bias (primary particle color)
+  /frozen/light      → float 0-1, brightness bias
+  /frozen/fan        → float 0-1, particle motion speed bias
+
+  /cue/snare         → (beat, bar, vel)
+  /cue/hit           → (name, beat, bar, vel)
+  /cue/note          → (midi, dur, beat, bar, vel)
+  /cue/bar           → bar flash
+"""
+
 import asyncio
 import colorsys
 import math
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import AsyncIOOSCUDPServer
 
 try:
     import pygame
-
     _HAS_PYGAME = True
 except Exception:
     pygame = None
     _HAS_PYGAME = False
 
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+OSC_HOST = "127.0.0.1"
+OSC_PORT = 9001
+WIDTH = 900
+HEIGHT = 520
+FPS = 60
+PARTICLE_COUNT = 72
+
+# Pixel plant sprite — 16×24 grid, each cell is PIXEL_SZ px square.
+# 0=transparent, 1=leaf, 2=stem, 3=soil/pot, 4=highlight, 5=dark leaf, 6=flower/tip
+PIXEL_SZ = 14  # base pixel block size
+
+# Plant sprite map (16 wide × 24 tall)
+# Rows read top→bottom
+PLANT_SPRITE = [
+    "0000000110000000",
+    "0000011111100000",
+    "0000111111110000",
+    "0001111441111000",
+    "0001114441111000",
+    "0000115511100000",
+    "0001155511110000",
+    "0001115551110000",
+    "0000011551100000",
+    "0000001551000000",
+    "0000001221000000",
+    "0000112221100000",
+    "0001122222110000",
+    "0001122222110000",
+    "0001122222110000",
+    "0000122221100000",
+    "0000012221000000",
+    "0333333333333300",
+    "0333333333333300",
+    "0033344433300000",  # pot
+    "0003333333000000",
+    "0003333333000000",
+    "0000033330000000",
+    "0000000000000000",
+]
+
+# ─── Shared OSC-driven state ──────────────────────────────────────────────────
 
 @dataclass
 class VizState:
     phase: str = "idle"
     hue: float = 0.5
     energy: float = 0.0
-    fan: float = 0.5
-    light: float = 0.5
-    frozen_hue: float = 0.5
     audio_level: float = 0.0
+    frozen_hue: float = 0.5
+    frozen_light: float = 0.5
+    frozen_fan: float = 0.5
     last_hit_at: float = 0.0
     hit_energy: float = 0.0
     note_energy: float = 0.0
     snare_energy: float = 0.0
-    last_note_midi: float = 60.0
-    burst_requests: list["BurstRequest"] = field(default_factory=list)
+    flash_until: float = 0.0
+    bar_flash_until: float = 0.0
+    # Plant bounce/squish state
+    plant_bounce: float = 0.0   # 0-1, decays each frame
+    plant_squish: float = 0.0   # 0-1, independent squish axis
+    plant_wiggle: float = 0.0   # lateral sway accumulator
+    # Thanks/emotion state
+    plant_emotion: str = ""
+    # Running session stats
+    total_hits: int = 0
+    total_notes: int = 0
+    total_bars: int = 0
+    peak_amplitude: float = 0.0
 
 
 state = VizState()
-_lava_blobs: list["LavaBlob"] = []
-_fire_particles: list["FireParticle"] = []
 
 
-@dataclass
-class BurstRequest:
-    intensity: float
-    hue: float
-    midi: float | None = None
-
-
-@dataclass
-class LavaBlob:
-    x: float
-    y: float
-    vx: float
-    vy: float
-    radius: float
-    hue: float
-    alpha: int
-
-
-@dataclass
-class FireParticle:
-    x: float
-    y: float
-    prev_x: float
-    prev_y: float
-    vx: float
-    vy: float
-    life: float
-    max_life: float
-    color: tuple[int, int, int]
-    size: int
-
+# ─── OSC handlers ─────────────────────────────────────────────────────────────
 
 def _set_phase(phase: str):
     def handler(_address, *_args):
         state.phase = phase
         print(f"[viz] phase -> {phase}")
-
     return handler
 
 
 def _mod_hue(_address, value):
-    state.hue = float(value)
+    state.hue = float(value) % 1.0
 
 
 def _mod_energy(_address, value):
-    state.energy = float(value)
+    state.energy = max(0.0, min(1.0, float(value)))
 
 
-def _frozen_fan(_address, value):
-    state.fan = max(0.0, min(1.0, float(value)))
+def _audio_pulse(_address, value):
+    state.audio_level = max(state.audio_level, max(0.0, min(1.0, float(value))))
 
 
 def _frozen_hue(_address, value):
@@ -96,365 +153,729 @@ def _frozen_hue(_address, value):
 
 
 def _frozen_light(_address, value):
-    state.light = max(0.0, min(1.0, float(value)))
+    state.frozen_light = max(0.0, min(1.0, float(value)))
 
 
-def _audio_pulse(_address, value):
-    state.audio_level = max(state.audio_level, max(0.0, min(1.0, float(value))))
+def _frozen_fan(_address, value):
+    state.frozen_fan = max(0.0, min(1.0, float(value)))
 
 
 def _cue_snare(_address, beat, bar, vel):
     state.last_hit_at = time.monotonic()
     state.snare_energy = max(state.snare_energy, min(1.0, float(vel)))
     state.hit_energy = max(state.hit_energy, min(1.0, float(vel)))
-    # Snare should always produce a visible burst for audiovisual sync.
-    state.burst_requests.append(BurstRequest(intensity=float(vel), hue=state.hue))
-    print(f"[viz] cue snare beat={beat} bar={bar} vel={vel}")
+    state.flash_until = time.monotonic() + 0.12
+    state.plant_bounce = min(1.0, state.plant_bounce + float(vel) * 1.0)
+    state.plant_squish = min(1.0, state.plant_squish + float(vel) * 0.6)
+    state.total_hits += 1
 
 
 def _cue_hit(_address, name, beat, bar, vel):
     state.last_hit_at = time.monotonic()
     state.hit_energy = max(state.hit_energy, min(1.0, float(vel)))
-    state.burst_requests.append(BurstRequest(intensity=max(0.62, float(vel)), hue=state.hue))
-    print(f"[viz] cue hit name={name} beat={beat} bar={bar} vel={vel}")
+    state.flash_until = time.monotonic() + 0.12
+    state.audio_level = max(state.audio_level, 0.9)
+    state.plant_bounce = min(1.0, state.plant_bounce + float(vel) * 0.8)
+    state.total_hits += 1
 
 
 def _cue_note(_address, midi, dur, beat, bar, vel):
     state.last_hit_at = time.monotonic()
     state.note_energy = max(state.note_energy, min(1.0, float(vel)))
-    state.last_note_midi = float(midi)
-    if state.phase == "listening":
-        state.burst_requests.append(
-            BurstRequest(intensity=float(vel), hue=(state.hue + 0.08) % 1.0, midi=float(midi))
-        )
-    print(f"[viz] cue note midi={midi} dur={dur} beat={beat} bar={bar} vel={vel}")
+    state.plant_wiggle += float(vel) * 0.4
+    state.total_notes += 1
 
+
+def _cue_bar(_address, *_args):
+    state.bar_flash_until = time.monotonic() + 0.18
+    state.plant_bounce = 1.0
+    state.total_bars += 1
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _hsv_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
-    r, g, b = colorsys.hsv_to_rgb(max(0.0, min(1.0, h)), max(0.0, min(1.0, s)), max(0.0, min(1.0, v)))
+    r, g, b = colorsys.hsv_to_rgb(
+        max(0.0, min(1.0, h)),
+        max(0.0, min(1.0, s)),
+        max(0.0, min(1.0, v)),
+    )
     return int(r * 255), int(g * 255), int(b * 255)
 
 
-def _draw_text_center(screen, text: str, font, y_offset: int = 0) -> None:
+def _draw_phase_label(screen, text: str, font, surfs, t: float = 0.0) -> None:
+    """Friendly animated badge showing the current state."""
     if font is None:
         return
-    surf = font.render(text, True, (36, 44, 52))
-    rect = surf.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2 + y_offset))
-    screen.blit(surf, rect)
-
-
-def _draw_phase_label(screen, text: str, font) -> None:
-    if font is None:
-        return
-    label_font = font
-    surf = label_font.render(text, True, (20, 28, 36))
-    pad_x, pad_y = 18, 10
+    # Animate trailing dots on any text ending with "..."
+    if text.endswith("..."):
+        dots = "." * (int(t * 2) % 4)
+        text = text[:-3] + dots
+    surf = font.render(text, True, (20, 28, 36))
+    pad_x, pad_y = 14, 8
     box_w = surf.get_width() + pad_x * 2
     box_h = surf.get_height() + pad_y * 2
     x = (screen.get_width() - box_w) // 2
-    y = int(screen.get_height() * 0.08)
-
-    badge = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
-    badge.fill((255, 255, 255, 220))
-    screen.blit(badge, (x, y))
+    y = int(screen.get_height() * 0.05)
+    # Reuse badge surface if size matches, otherwise reallocate (rare — only on font change)
+    if surfs.badge is None or surfs.badge.get_size() != (box_w, box_h):
+        surfs.badge = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+    surfs.badge.fill((255, 255, 255, 180))
+    screen.blit(surfs.badge, (x, y))
     screen.blit(surf, (x + pad_x, y + pad_y))
 
 
-def _draw_ambient(screen, font, t: float) -> None:
-    w, h = screen.get_size()
-    base_hue = (state.frozen_hue * 0.7 + state.hue * 0.3) % 1.0
-    r, g, b = _hsv_rgb(base_hue, 0.22, 0.95)
-    screen.fill((r, g, b))
-
-    dt = time.monotonic() - state.last_hit_at
-    if dt < 0.1:
-        alpha = int(55 * (1.0 - dt / 0.1))
-        flash = pygame.Surface((w, h), pygame.SRCALPHA)
-        flash.fill((255, 255, 255, alpha))
-        screen.blit(flash, (0, 0))
-
-    audio_alpha = int(85 * state.audio_level)
-    if audio_alpha > 0:
-        pulse = pygame.Surface((w, h), pygame.SRCALPHA)
-        pulse.fill((255, 255, 255, audio_alpha))
-        screen.blit(pulse, (0, 0))
-
-    _draw_phase_label(screen, "IDLE", font)
+def _wrap_text(font, text: str, max_width: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if font.size(candidate)[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
 
 
-def _draw_vertical_gradient(screen, top_color: tuple[int, int, int], bottom_color: tuple[int, int, int]) -> None:
-    w, h = screen.get_size()
-    for y in range(h):
-        a = y / max(1, h - 1)
-        r = int(top_color[0] * (1.0 - a) + bottom_color[0] * a)
-        g = int(top_color[1] * (1.0 - a) + bottom_color[1] * a)
-        b = int(top_color[2] * (1.0 - a) + bottom_color[2] * a)
-        pygame.draw.line(screen, (r, g, b), (0, y), (w, y))
+# ─── IDLE: Dreamy glowing particle field ──────────────────────────────────────
+
+def _make_particles() -> list[dict]:
+    return [
+        {
+            "x": random.uniform(0, WIDTH),
+            "y": random.uniform(0, HEIGHT),
+            "vx": random.uniform(-0.35, 0.35),
+            "vy": random.uniform(-0.35, 0.35),
+            "base_size": random.uniform(2.5, 6.5),
+            "phase": random.uniform(0, math.tau),
+            "hue_offset": random.uniform(-0.08, 0.08),
+        }
+        for _ in range(PARTICLE_COUNT)
+    ]
 
 
-def _ensure_lava_blobs(w: int, h: int) -> None:
-    if _lava_blobs:
-        return
-    count = random.randint(5, 8)
-    min_r = int(h * 0.10)
-    max_r = int(h * 0.20)
-    for i in range(count):
-        radius = random.uniform(min_r, max_r)
-        _lava_blobs.append(
-            LavaBlob(
-                x=random.uniform(radius, w - radius),
-                y=random.uniform(radius, h - radius),
-                vx=random.uniform(-24.0, 24.0),
-                vy=random.uniform(-20.0, 20.0),
-                radius=radius,
-                hue=(state.frozen_hue + i * 0.06 + random.uniform(-0.03, 0.03)) % 1.0,
-                alpha=random.randint(42, 78),
-            )
+_particles = _make_particles()
+
+
+def _draw_idle(screen, font, surfs, t: float, amplitude: float, hue: float, brightness: float) -> None:
+    surfs.fade.fill((5, 5, 18))
+    surfs.fade.set_alpha(28)
+    screen.blit(surfs.fade, (0, 0))
+
+    if time.monotonic() < state.flash_until:
+        remaining = state.flash_until - time.monotonic()
+        surfs.flash.fill((255, 255, 255, int(40 * (remaining / 0.12))))
+        screen.blit(surfs.flash, (0, 0))
+
+    if time.monotonic() < state.bar_flash_until:
+        surfs.bar_flash.fill((255, 240, 180, 55))
+        screen.blit(surfs.bar_flash, (0, 0))
+
+    surfs.particle_layer.fill((0, 0, 0, 0))
+    particle_layer = surfs.particle_layer
+    speed_bias = 0.5 + state.frozen_fan * 1.5
+
+    for p in _particles:
+        p["x"] += (p["vx"] + math.sin(t * 0.9 + p["phase"]) * 0.22) * speed_bias
+        p["y"] += (p["vy"] + math.cos(t * 0.65 + p["phase"]) * 0.22) * speed_bias
+        p["x"] %= WIDTH
+        p["y"] %= HEIGHT
+
+        pulse = 1.0 + amplitude * 3.5 + state.hit_energy * 2.0
+        size = max(1, int(p["base_size"] * pulse))
+
+        ph = (hue + p["hue_offset"]) % 1.0
+        val = min(1.0, brightness * 0.55 + 0.28 + amplitude * 0.45)
+        r, g, b = _hsv_rgb(ph, 0.65, val)
+
+        glow_alpha = int(30 + amplitude * 60)
+        pygame.draw.circle(particle_layer, (r, g, b, glow_alpha), (int(p["x"]), int(p["y"])), size * 2)
+
+        core_alpha = int(140 + amplitude * 100)
+        pygame.draw.circle(particle_layer, (r, g, b, core_alpha), (int(p["x"]), int(p["y"])), size)
+
+    screen.blit(particle_layer, (0, 0))
+    _draw_phase_label(screen, "waiting for the plant...", font, surfs, t)
+
+
+# ─── LISTENING: Pulsing green orb + ripples + animated dots ──────────────────
+
+def _draw_listening(screen, font, surfs, t: float) -> None:
+    # Light background — soft warm white tinted by hue
+    amplitude = max(state.audio_level, state.hit_energy * 0.7, state.energy * 0.5)
+    hue = (state.frozen_hue * 0.65 + state.hue * 0.35) % 1.0
+    bg_r, bg_g, bg_b = _hsv_rgb(hue, 0.07, 0.97)
+    screen.fill((bg_r, bg_g, bg_b))
+
+    cx, cy = WIDTH // 2, HEIGHT // 2
+
+    # ── Layer 1: slow rotating background rings ───────────────────────────────
+    surfs.ripple.fill((0, 0, 0, 0))
+    num_bg_rings = 6
+    for i in range(num_bg_rings):
+        ring_hue = (hue + i * 0.06) % 1.0
+        r, g, b = _hsv_rgb(ring_hue, 0.55, 0.55 + i * 0.04)  # darker rings on light bg
+        base_radius = 60 + i * 38
+        wobble = math.sin(t * 0.7 + i * 1.1) * 6
+        pygame.draw.circle(surfs.ripple, (r, g, b, 55), (cx, cy),
+                           max(4, int(base_radius + wobble)), 1)
+    screen.blit(surfs.ripple, (0, 0))
+
+    # ── Layer 2: radial spikes — the main burst ───────────────────────────────
+    surfs.orbit_layer.fill((0, 0, 0, 0))
+    NUM_SPIKES = 64
+    for i in range(NUM_SPIKES):
+        angle = (i / NUM_SPIKES) * math.tau
+
+        # Each spike has its own phase so they ripple around the circle
+        spike_phase = t * 2.8 + i * (math.tau / NUM_SPIKES) * 2.5
+        note_spike  = state.note_energy * 0.6 * math.sin(t * 6.0 + i * 0.4)
+        snare_spike = state.snare_energy * math.exp(-((i - NUM_SPIKES // 4) ** 2) / 80.0)
+
+        length = (
+            28                                          # base
+            + amplitude * 110                          # amplitude stretches all spikes
+            + 30 * math.sin(spike_phase)               # rolling wave
+            + note_spike * 55                          # notes add pointy bursts
+            + snare_spike * 70                         # snare hits one quadrant hard
         )
+        length = max(4, length)
 
+        inner_r = 28 + amplitude * 18
+        ox = cx + math.cos(angle) * inner_r
+        oy = cy + math.sin(angle) * inner_r
+        ex = cx + math.cos(angle) * (inner_r + length)
+        ey = cy + math.sin(angle) * (inner_r + length)
 
-def _spawn_firework(req: BurstRequest, w: int, h: int) -> None:
-    intensity = max(0.15, min(1.0, req.intensity))
-    x = random.uniform(w * 0.15, w * 0.85)
-    if req.midi is not None:
-        pitch_norm = max(0.0, min(1.0, (req.midi - 36.0) / 60.0))
-        y = h * (0.78 - pitch_norm * 0.52)
+        # Hue rotates around the ring + shifts with OSC hue
+        spike_hue = (hue + i / NUM_SPIKES * 0.5 + t * 0.04) % 1.0
+        brightness = min(0.75, 0.35 + amplitude * 0.35 + state.snare_energy * 0.2)  # darker for light bg
+        r, g, b = _hsv_rgb(spike_hue, 0.90, brightness)
+
+        # Thick inner glow line + thin bright outer tip
+        alpha_outer = int(180 + amplitude * 75)
+        alpha_inner = int(80 + amplitude * 60)
+        tip_len = length * 0.35
+        mid_x = cx + math.cos(angle) * (inner_r + length - tip_len)
+        mid_y = cy + math.sin(angle) * (inner_r + length - tip_len)
+
+        pygame.draw.line(surfs.orbit_layer, (r, g, b, alpha_inner),
+                         (int(ox), int(oy)), (int(mid_x), int(mid_y)), 3)
+        pygame.draw.line(surfs.orbit_layer, (r, g, b, alpha_outer),
+                         (int(mid_x), int(mid_y)), (int(ex), int(ey)), 2)
+
+    screen.blit(surfs.orbit_layer, (0, 0))
+
+    # ── Layer 3: beat shockwave rings — expand outward on snare/hit ──────────
+    surfs.glow_layer.fill((0, 0, 0, 0))
+    # Use flash_until timing to drive ring expansion
+    flash_age = max(0.0, t - (state.flash_until - 0.12 - (t - t)))  # approximate age
+    now = time.monotonic()
+    if state.flash_until > now:
+        flash_progress = 1.0 - (state.flash_until - now) / 0.12
     else:
-        y = random.uniform(h * 0.22, h * 0.65)
+        flash_progress = 1.0
+    for ring_i in range(3):
+        offset = ring_i * 0.3
+        expand = (flash_progress + offset) % 1.0
+        ring_r = int(30 + expand * 220)
+        ring_alpha = max(0, int(120 * (1.0 - expand)))
+        sh, ss, sv = hue, 0.6, 0.95
+        sr, sg, sb = _hsv_rgb(sh, ss, sv)
+        if ring_alpha > 4:
+            pygame.draw.circle(surfs.glow_layer, (sr, sg, sb, ring_alpha),
+                               (cx, cy), ring_r, 2)
+    screen.blit(surfs.glow_layer, (0, 0))
 
-    count = int(16 + intensity * 48)
-    speed = 90.0 + intensity * 220.0
-    base_hue = req.hue
+    # ── Layer 4: central orb ─────────────────────────────────────────────────
+    orb_pulse = 0.5 + 0.5 * math.sin(t * 3.8)
+    orb_radius = int(22 + amplitude * 28 + orb_pulse * 8 + state.snare_energy * 14)
+    orb_r, orb_g, orb_b = _hsv_rgb(hue, 0.75, 0.55)  # richer, darker orb on light bg
 
-    for _ in range(count):
-        ang = random.uniform(0.0, math.tau)
-        spd = speed * random.uniform(0.55, 1.05)
-        vx = math.cos(ang) * spd
-        vy = math.sin(ang) * spd - random.uniform(12.0, 60.0)
-        life = random.uniform(0.45, 0.95)
-        hue = (base_hue + random.uniform(-0.06, 0.06)) % 1.0
-        sat = random.uniform(0.55, 0.9)
-        val = random.uniform(0.25, 0.75)
-        color = _hsv_rgb(hue, sat, val)
-        _fire_particles.append(
-            FireParticle(
-                x=x,
-                y=y,
-                prev_x=x,
-                prev_y=y,
-                vx=vx,
-                vy=vy,
-                life=life,
-                max_life=life,
-                color=color,
-                size=random.randint(1, 3),
-            )
-        )
+    # Soft glow layers around orb
+    surfs.highlight.fill((0, 0, 0, 0))
+    for glow_i in range(5):
+        gr = orb_radius + glow_i * 12
+        ga = max(0, int(70 - glow_i * 14))
+        pygame.draw.circle(surfs.highlight, (orb_r, orb_g, orb_b, ga), (cx, cy), gr)
+    screen.blit(surfs.highlight, (0, 0))
+    pygame.draw.circle(screen, (orb_r, orb_g, orb_b), (cx, cy), orb_radius)
 
+    # Inner highlight
+    hl_col = (min(255, orb_r + 60), min(255, orb_g + 60), min(255, orb_b + 60))
+    pygame.draw.circle(screen, hl_col, (cx - orb_radius // 4, cy - orb_radius // 4),
+                       max(3, orb_radius // 3))
 
-def _update_draw_particles(screen, dt: float) -> None:
-    gravity = 240.0
-    canvas = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-    keep: list[FireParticle] = []
-    for p in _fire_particles:
-        p.prev_x, p.prev_y = p.x, p.y
-        p.vy += gravity * dt
-        p.x += p.vx * dt
-        p.y += p.vy * dt
-        p.life -= dt
-        if p.life <= 0.0:
-            continue
-        life_n = p.life / p.max_life
-        alpha = int(255 * (life_n ** 1.6))
-        sx, sy = int(p.x), int(p.y)
-        tx, ty = int(p.prev_x), int(p.prev_y)
-        pygame.draw.line(canvas, (*p.color, max(0, alpha // 2)), (tx, ty), (sx, sy), width=1)
-        pygame.draw.circle(canvas, (*p.color, alpha), (sx, sy), p.size)
-        keep.append(p)
-    _fire_particles[:] = keep
-    screen.blit(canvas, (0, 0))
+    _draw_phase_label(screen, "plant is listening...", font, surfs, t)
 
 
-def _draw_listening_scene(screen, font, t: float, dt: float) -> None:
-    w, h = screen.get_size()
-    _ensure_lava_blobs(w, h)
+# ─── TALKING: Pixelated plant character dancing to the music ─────────────────
 
-    state.hit_energy *= 0.93
-    state.note_energy *= 0.94
-    state.snare_energy *= 0.92
+def _build_plant_palette(hue: float, amplitude: float, t: float) -> dict:
+    """
+    Builds a color palette for the pixel plant.
+    Hue shifts with OSC hue, amplitude brightens.
+    Returns dict mapping sprite code → RGBA tuple.
+    """
+    leaf_h = (hue + 0.33) % 1.0          # green-ish leaves offset from accent hue
+    dark_h = (hue + 0.35) % 1.0
+    tip_h  = (hue + 0.05) % 1.0          # flower/tip close to accent hue
+    stem_h = (hue + 0.30) % 1.0
 
-    base_hue = (state.frozen_hue * 0.75 + state.hue * 0.25) % 1.0
-    top = _hsv_rgb(base_hue, 0.20, 0.98)
-    bottom = _hsv_rgb((base_hue + 0.03) % 1.0, 0.22, 0.90)
-    _draw_vertical_gradient(screen, top, bottom)
+    leaf_v  = min(0.65, 0.38 + amplitude * 0.27)   # richer, darker green
+    dark_v  = min(0.45, 0.18 + amplitude * 0.22)   # deep shadow leaf
+    tip_v   = min(0.75, 0.55 + amplitude * 0.20)   # vivid tip/flower
+    stem_v  = min(0.55, 0.28 + amplitude * 0.22)   # darker stem
+    pot_v   = min(0.60, 0.38 + amplitude * 0.18)   # terracotta-ish pot
+    soil_v  = min(0.40, 0.22 + amplitude * 0.12)   # dark soil
 
-    blobs_layer = pygame.Surface((w, h), pygame.SRCALPHA)
-    music_energy = max(state.hit_energy, state.note_energy, state.snare_energy, state.energy, state.audio_level)
-    speed_mul = 0.35 + state.fan * 2.6
-    flicker_mul = 0.15 + state.light * 0.85
-    vibe_freq = 0.7 + state.frozen_hue * 3.2
-    vibe_amp = 0.8 + state.frozen_hue * 6.5
-    for i, blob in enumerate(_lava_blobs):
-        vibex = math.sin(t * (vibe_freq + i * 0.05) + i * 0.9) * vibe_amp
-        vibey = math.cos(t * (vibe_freq * 0.8 + i * 0.07) + i * 0.4) * vibe_amp
-        blob.x += blob.vx * dt * speed_mul + vibex * dt
-        blob.y += blob.vy * dt * speed_mul + vibey * dt
+    # Slight color shimmer on highlight with time
+    hl_pulse = 0.5 + 0.5 * math.sin(t * 6.0)
 
-        if blob.x - blob.radius <= 0:
-            blob.x = blob.radius
-            blob.vx = abs(blob.vx)
-        elif blob.x + blob.radius >= w:
-            blob.x = w - blob.radius
-            blob.vx = -abs(blob.vx)
-        if blob.y - blob.radius <= 0:
-            blob.y = blob.radius
-            blob.vy = abs(blob.vy)
-        elif blob.y + blob.radius >= h:
-            blob.y = h - blob.radius
-            blob.vy = -abs(blob.vy)
-
-        blob.hue = (blob.hue + 0.005 * dt + 0.0004 * math.sin(t * 0.5 + i)) % 1.0
-        flicker = (0.5 + 0.5 * math.sin(t * (2.2 + i * 0.13) + i)) * flicker_mul
-        value = 0.48 + 0.30 * max(0.0, min(1.0, state.energy)) + 0.22 * music_energy + 0.16 * flicker
-        value = max(0.0, min(1.0, value))
-        color = _hsv_rgb(blob.hue, 0.45, value)
-        alpha = int(min(210, blob.alpha + music_energy * 90 + state.light * 35))
-        pygame.draw.circle(blobs_layer, (*color, alpha), (int(blob.x), int(blob.y)), int(blob.radius))
-    screen.blit(blobs_layer, (0, 0))
-
-    # Flower-like bloom overlay: rotating translucent petals that open with sound energy.
-    petals = pygame.Surface((w, h), pygame.SRCALPHA)
-    cx, cy = w // 2, h // 2
-    petal_count = 12
-    bloom = 0.35 + music_energy * 0.95
-    ring_r = min(w, h) * (0.14 + 0.06 * bloom)
-    petal_w = int(min(w, h) * (0.07 + 0.04 * bloom))
-    petal_h = int(min(w, h) * (0.20 + 0.10 * bloom))
-    for i in range(petal_count):
-        ang = (math.tau * i / petal_count) + t * (0.18 + 0.25 * state.fan)
-        px = cx + math.cos(ang) * ring_r
-        py = cy + math.sin(ang) * ring_r
-        ph = (base_hue + i * 0.018 + 0.03 * math.sin(t + i)) % 1.0
-        pr, pg, pb = _hsv_rgb(ph, 0.42, 0.78 + 0.18 * music_energy)
-        alpha = int(38 + 110 * bloom)
-        pygame.draw.ellipse(
-            petals,
-            (pr, pg, pb, alpha),
-            (int(px - petal_w * 0.5), int(py - petal_h * 0.5), petal_w, petal_h),
-        )
-        # Blossom center glow.
-        pygame.draw.circle(
-            petals,
-            (255, 255, 255, int(10 + 45 * music_energy)),
-            (cx, cy),
-            int(min(w, h) * (0.08 + 0.03 * bloom)),
-        )
-    screen.blit(petals, (0, 0))
-
-    _draw_phase_label(screen, "LISTENING", font)
+    return {
+        "0": None,  # transparent
+        "1": (*_hsv_rgb(leaf_h, 0.70, leaf_v), 255),
+        "2": (*_hsv_rgb(stem_h, 0.60, stem_v), 255),
+        "3": (*_hsv_rgb(stem_h, 0.45, pot_v),  255),
+        "4": (*_hsv_rgb(leaf_h, 0.25, min(1.0, leaf_v + 0.35 + hl_pulse * 0.1)), 255),  # highlight
+        "5": (*_hsv_rgb(dark_h, 0.80, dark_v), 255),
+        "6": (*_hsv_rgb(tip_h,  0.85, tip_v),  255),
+    }
 
 
-def _draw_phase_scene(screen, font) -> None:
-    base_hue = (state.frozen_hue * 0.7 + state.hue * 0.3) % 1.0
-    r, g, b = _hsv_rgb(base_hue, 0.15, 0.95)
-    screen.fill((r, g, b))
-    if state.phase == "talking":
-        _draw_phase_label(screen, "TALKING", font)
-    elif state.phase == "thanks":
-        _draw_phase_label(screen, "THANK YOU", font)
+def _draw_plant_sprite(
+    surface,
+    cx: int,
+    cy: int,
+    pixel_sz: int,
+    palette: dict,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    wiggle: float = 0.0,
+    hue: float = 0.5,
+    amplitude: float = 0.0,
+    t: float = 0.0,
+) -> None:
+    """
+    Renders the pixel-art plant sprite onto `surface`, centered at (cx, cy).
+    scale_x / scale_y allow squish/stretch. wiggle shifts columns sideways.
+    """
+    rows = len(PLANT_SPRITE)
+    cols = len(PLANT_SPRITE[0])
 
-    # Subtle audio-reactive overlay for non-listening phases.
-    if state.audio_level > 0.01:
-        overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-        alpha = int(70 * state.audio_level)
-        overlay.fill((255, 255, 255, alpha))
-        screen.blit(overlay, (0, 0))
+    total_w = int(cols * pixel_sz * scale_x)
+    total_h = int(rows * pixel_sz * scale_y)
+    origin_x = cx - total_w // 2
+    origin_y = cy - total_h // 2
 
+    for row_idx, row in enumerate(PLANT_SPRITE):
+        for col_idx, code in enumerate(row):
+            color = palette.get(code)
+            if color is None:
+                continue
+
+            # Per-column lateral wiggle (top of plant sways more than base)
+            row_fraction = row_idx / max(1, rows - 1)
+            sway_amount = wiggle * (1.0 - row_fraction) * pixel_sz * 0.6
+
+            bx = int(origin_x + col_idx * pixel_sz * scale_x + sway_amount)
+            by = int(origin_y + row_idx * pixel_sz * scale_y)
+            bw = max(1, int(pixel_sz * scale_x))
+            bh = max(1, int(pixel_sz * scale_y))
+
+            # Draw block
+            pygame.draw.rect(surface, color[:3], (bx, by, bw, bh))
+
+            # Subtle scanline pixel grid (dark border) for pixel-art feel
+            if pixel_sz >= 6:
+                border_col = (
+                    max(0, color[0] - 40),
+                    max(0, color[1] - 40),
+                    max(0, color[2] - 40),
+                )
+                pygame.draw.rect(surface, border_col, (bx, by, bw, bh), 1)
+
+
+def _draw_talking(screen, font, surfs, t: float, amplitude: float, hue: float) -> None:
+    # Light background for the listening orb.
+    bg_r, bg_g, bg_b = _hsv_rgb(hue, 0.07, 0.97)
+    screen.fill((bg_r, bg_g, bg_b))
+
+    cx, cy = WIDTH // 2, HEIGHT // 2
+
+    # ── Slow outer ripple rings ───────────────────────────────────────────────
+    surfs.ripple.fill((0, 0, 0, 0))
+    for i in range(3):
+        ripple_phase = t * 1.4 - i * 0.7
+        ripple_r = int(90 + i * 28 + 18 * math.sin(ripple_phase))
+        ripple_alpha = max(0, int(55 - i * 16))
+        orb_r, orb_g, orb_b = _hsv_rgb(hue, 0.50, 0.52)
+        pygame.draw.circle(surfs.ripple, (orb_r, orb_g, orb_b, ripple_alpha),
+                           (cx, cy), ripple_r, 2)
+    screen.blit(surfs.ripple, (0, 0))
+
+    # ── Central pulsing orb ───────────────────────────────────────────────────
+    pulse = 0.5 + 0.5 * math.sin(t * 3.1)
+    radius = int(44 + pulse * 28)
+    orb_r, orb_g, orb_b = _hsv_rgb(hue, 0.65, 0.45 + pulse * 0.22)
+    pygame.draw.circle(screen, (orb_r, orb_g, orb_b), (cx, cy), radius)
+
+    # Inner highlight
+    surfs.highlight.fill((0, 0, 0, 0))
+    hl_r = max(4, int(radius * 0.38))
+    pygame.draw.circle(surfs.highlight, (255, 255, 255, int(55 + pulse * 45)),
+                       (cx - radius // 5, cy - radius // 5), hl_r)
+    screen.blit(surfs.highlight, (0, 0))
+
+    _draw_phase_label(screen, "talking to plant...", font, surfs, t)
+
+
+# ─── THANKS: Mood-engine plant emotion ───────────────────────────────────────
+
+MOOD_LINES = {
+    "OVERWHELMED": [
+        "Ahh, this wind is intense. My leaves are drying out.",
+        "Too bright. I am overwhelmed, can we soften the light?",
+        "Wind is way too strong. I would love calmer air.",
+        "Bright light plus big breeze is stress mode for me.",
+        "Gentler please. I grow best with calm air and soft light.",
+        "I am getting blasted, dim the light or lower the fan.",
+    ],
+    "HUNGRY": [
+        "I am hungry for light. Please brighten it a bit.",
+        "I can survive low light, but I cannot really grow here.",
+        "More glow please. It is too dim to thrive.",
+        "The breeze is fine, I just need more light.",
+        "Feed me photons. A little brighter would help.",
+        "I am stretching for light and feeling sleepy.",
+    ],
+    "CONTENT": [
+        "This feels just right. Soft light and calm air, thank you.",
+        "Comfy mode. Gentle glow and a calm breeze.",
+        "I am chilling. My leaves feel relaxed and happy.",
+        "Perfect balance. I can breathe and grow steadily.",
+        "This is my sweet spot. Keep it here.",
+        "Everything feels easy right now.",
+    ],
+    "INSPIRED": [
+        "Yes, this light makes me feel like growing.",
+        "Inspired. Bright enough for energy, gentle air to stay cool.",
+        "I am in my growth era. Keep this steady.",
+        "This is motivating, like sunny shade.",
+        "I feel charged and ready to unfurl new leaves.",
+        "Bright and kind. I am thriving.",
+    ],
+    "ALERT": [
+        "Okay, I am awake now. Just do not push it too far.",
+        "I feel active. Slightly less wind would be even nicer.",
+        "Bright and breezy is fun, keep it gentle.",
+        "I am alert and moving with the room.",
+        "This is lively. A softer edge would be perfect.",
+        "I can handle this, just not much more.",
+    ],
+}
+
+HUE_LINES = {
+    "red/pink": "Pink-red glow feels bold, just keep it soft.",
+    "yellow": "Warm yellow light feels sunny, but not too intense.",
+    "green": "Green vibes feel fresh and leafy.",
+    "cyan": "Cyan feels crisp and airy.",
+    "blue": "Blue light feels cool and focused.",
+    "purple": "Purple glow feels dreamy and calm.",
+}
+
+
+def _bucket_light(light: float) -> str:
+    if light < 0.25:
+        return "low"
+    if light < 0.60:
+        return "ok"
+    if light < 0.85:
+        return "high"
+    return "harsh"
+
+
+def _bucket_wind(wind: float) -> str:
+    if wind < 0.15:
+        return "still"
+    if wind < 0.40:
+        return "calm"
+    if wind < 0.65:
+        return "breezy"
+    return "strong"
+
+
+def _hue_family(hue: float) -> str:
+    deg = (hue % 1.0) * 360.0
+    if deg >= 330.0 or deg < 30.0:
+        return "red/pink"
+    if deg < 70.0:
+        return "yellow"
+    if deg < 160.0:
+        return "green"
+    if deg < 200.0:
+        return "cyan"
+    if deg < 260.0:
+        return "blue"
+    return "purple"
+
+
+def _choose_mood(light_bucket: str, wind_bucket: str) -> str:
+    if light_bucket == "harsh" or wind_bucket == "strong":
+        return "OVERWHELMED"
+    if light_bucket == "low":
+        return "HUNGRY"
+    if light_bucket == "ok" and wind_bucket in ("still", "calm"):
+        return "CONTENT"
+    if light_bucket == "high" and wind_bucket in ("calm", "breezy"):
+        return "INSPIRED"
+    return "ALERT"
+
+
+def _build_mood_message(light: float, wind: float, hue: float) -> str:
+    light_bucket = _bucket_light(light)
+    wind_bucket = _bucket_wind(wind)
+    hue_bucket = _hue_family(hue)
+    mood = _choose_mood(light_bucket, wind_bucket)
+
+    primary = random.choice(MOOD_LINES[mood])
+    lines = [primary]
+    if random.random() < 0.85:
+        lines.append(HUE_LINES[hue_bucket])
+    return " ".join(lines)
+
+
+def _draw_thanks(screen, font, surfs, t: float) -> None:
+    # Warm cream/gold background that pulses gently
+    pulse = 0.5 + 0.5 * math.sin(t * 4.0)
+    bg_r = int(248 + pulse * 7)
+    bg_g = int(240 + pulse * 8)
+    bg_b = int(210 + pulse * 20)
+    screen.fill((bg_r, bg_g, bg_b))
+
+    cx, cy = WIDTH // 2, HEIGHT // 2
+
+    if font is None:
+        return
+
+    # ── "THANK YOU!" — large, bouncy ─────────────────────────────────────────
+    bounce = int(6 * math.sin(t * 5.5))
+    ty_surf = font.render("THANK YOU!", True, (34, 28, 18))
+    ty_rect = ty_surf.get_rect(center=(cx, cy - 46 + bounce))
+    screen.blit(ty_surf, ty_rect)
+
+    # ── Emotion line ──────────────────────────────────────────────────────────
+    emotion_text = state.plant_emotion or "I am still catching my breath."
+    color = (80, 60, 20)
+
+    # Use a slightly smaller font for the emotion — render manually scaled
+    try:
+        small_font = pygame.font.SysFont("Avenir Next", 28) or pygame.font.SysFont("Arial", 28)
+    except Exception:
+        small_font = font
+
+    wrapped = _wrap_text(small_font, emotion_text, int(WIDTH * 0.82))
+    line_height = small_font.get_linesize()
+    total_height = line_height * len(wrapped)
+    top_y = cy + 24 - total_height // 2
+    em_rect = pygame.Rect(cx, cy + 24, 1, 1)
+    for idx, line in enumerate(wrapped):
+        em_surf = small_font.render(line, True, color)
+        line_rect = em_surf.get_rect(center=(cx, top_y + idx * line_height + line_height // 2))
+        screen.blit(em_surf, line_rect)
+        em_rect = em_rect.union(line_rect)
+
+    # Soft underline flourish
+    line_y = em_rect.bottom + 6
+    line_w = em_rect.width + 20
+    pygame.draw.line(screen, (180, 160, 100), (cx - line_w // 2, line_y), (cx + line_w // 2, line_y), 2)
+
+    # ── Small leaf decorations either side ───────────────────────────────────
+    leaf_color = (80, 150, 80)
+    for side in (-1, 1):
+        lx = cx + side * (em_rect.width // 2 + 28)
+        ly = cy + 24
+        sway = int(4 * math.sin(t * 3.2 + side))
+        pts = [
+            (lx, ly + sway),
+            (lx + side * 14, ly - 10 + sway),
+            (lx + side * 8, ly + 12 + sway),
+        ]
+        pygame.draw.polygon(screen, leaf_color, pts)
+
+    _draw_phase_label(screen, "the plant thanks you...", font, surfs, t)
+
+
+# ─── Pre-allocated surface pool ──────────────────────────────────────────────
+
+class Surfaces:
+    """All reusable pygame Surfaces, allocated once at renderer startup."""
+    def __init__(self):
+        # Opaque fade overlay (no alpha channel needed — uses set_alpha instead)
+        self.fade          = pygame.Surface((WIDTH, HEIGHT))
+        # Full-screen SRCALPHA overlays
+        self.flash         = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.bar_flash     = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.particle_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.ripple        = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.highlight     = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.orbit_layer   = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.glow_layer    = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        # Badge surface is variable-sized; start as None, lazily allocated once
+        self.badge         = None
+
+
+# ─── Pygame render loop ───────────────────────────────────────────────────────
 
 async def _run_pygame_renderer() -> None:
     pygame.init()
-    screen = pygame.display.set_mode((1000, 600))
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Botanical Beats Visualizer")
+
     font = None
     try:
         pygame.font.init()
-        font = pygame.font.SysFont("Avenir Next", 46)
+        font = pygame.font.SysFont("Avenir Next", 42)
+        if font is None:
+            font = pygame.font.SysFont("Arial", 42)
     except Exception as exc:
-        print(f"[viz] pygame font unavailable, running without on-screen text: {exc}")
-    clock = pygame.time.Clock()
+        print(f"[viz] font unavailable: {exc}")
 
+    # Allocate all surfaces once here — never inside draw functions.
+    surfs = Surfaces()
+
+    clock = pygame.time.Clock()
+    t = 0.0
+    thanks_entered_at: float = 0.0
     running = True
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
 
         dt = max(0.0001, clock.get_time() / 1000.0)
-        if state.phase == "idle":
-            _draw_ambient(screen, font, time.monotonic())
-        else:
-            if state.phase == "listening":
-                _draw_listening_scene(screen, font, time.monotonic(), dt)
-            else:
-                _draw_phase_scene(screen, font)
+        t += dt
 
-        # Draw cue bursts over every phase so touch/hit always has visual feedback.
-        while state.burst_requests:
-            _spawn_firework(state.burst_requests.pop(0), screen.get_width(), screen.get_height())
-        _update_draw_particles(screen, dt)
-        state.audio_level *= 0.9
+        # Decay energies each frame.
+        state.hit_energy   *= 0.93
+        state.note_energy  *= 0.94
+        state.snare_energy *= 0.92
+        state.audio_level  *= 0.90
+
+        # Decay plant physics.
+        state.plant_bounce = max(0.0, state.plant_bounce - dt * 5.5)
+        state.plant_squish = max(0.0, state.plant_squish - dt * 6.0)
+        state.plant_wiggle *= 0.96
+
+        # Composite amplitude signal.
+        amplitude = max(state.audio_level, state.hit_energy * 0.7, state.energy * 0.5)
+        hue = (state.frozen_hue * 0.65 + state.hue * 0.35) % 1.0
+        brightness = state.frozen_light
+
+        # Auto-transition from thanks → idle after 10 s (long enough to read the emotion).
+        if state.phase == "thanks":
+            if thanks_entered_at == 0.0:
+                thanks_entered_at = time.monotonic()
+                # Generate mood text once at thanks entry.
+                state.peak_amplitude = max(state.peak_amplitude, amplitude)
+                state.plant_emotion = _build_mood_message(
+                    state.frozen_light,
+                    state.frozen_fan,
+                    hue,
+                )
+                print(f"[viz] plant emotion: {state.plant_emotion}")
+            state.peak_amplitude = max(state.peak_amplitude, amplitude)
+            if time.monotonic() - thanks_entered_at > 10.0:
+                state.phase = "idle"
+                thanks_entered_at = 0.0
+                # Reset session stats for next performance
+                state.total_hits = 0
+                state.total_notes = 0
+                state.total_bars = 0
+                state.peak_amplitude = 0.0
+        else:
+            thanks_entered_at = 0.0
+
+        if state.phase == "idle":
+            _draw_idle(screen, font, surfs, t, amplitude, hue, brightness)
+        elif state.phase == "talking":
+            # Talking uses the orb scene on a light background.
+            _draw_talking(screen, font, surfs, t, amplitude, hue)
+        elif state.phase == "listening":
+            # Listening uses the radial analyzer scene.
+            _draw_listening(screen, font, surfs, t)
+        elif state.phase == "listenting":
+            # Follow-up typo-address phase uses the radial analyzer.
+            _draw_listening(screen, font, surfs, t)
+        elif state.phase == "thanks":
+            _draw_thanks(screen, font, surfs, t)
+        else:
+            r, g, b = _hsv_rgb(hue, 0.18, 0.92)
+            screen.fill((r, g, b))
+            _draw_phase_label(screen, state.phase.upper(), font, surfs)
 
         pygame.display.flip()
-        clock.tick(60)
+        clock.tick(FPS)
         await asyncio.sleep(0)
 
     pygame.quit()
 
 
+# ─── Console fallback ─────────────────────────────────────────────────────────
+
 async def _run_console_renderer() -> None:
-    print("[viz] Not using pygame. Running console visualizer.")
+    print("[viz] pygame unavailable — console renderer active.")
     while True:
-        if state.phase == "idle":
-            print(
-                f"[viz] ambient phase={state.phase} hue={state.hue:.2f} energy={state.energy:.2f}"
-            )
-        elif state.phase == "talking":
-            print("[viz] ...talking to plant")
-        elif state.phase == "listening":
-            print("[viz] ..listening to plant")
-        elif state.phase == "thanks":
-            print("[viz] thanks for listening")
+        amplitude = max(state.audio_level, state.hit_energy * 0.7)
+        print(f"[viz] phase={state.phase:12s}  hue={state.hue:.2f}  amp={amplitude:.2f}")
         await asyncio.sleep(1.0)
 
 
+# ─── OSC server + entry point ─────────────────────────────────────────────────
+
 async def main() -> None:
     dispatcher = Dispatcher()
-    dispatcher.map("/state/idle", _set_phase("idle"))
-    dispatcher.map("/state/talking", _set_phase("talking"))
-    dispatcher.map("/state/listening", _set_phase("listening"))
-    dispatcher.map("/state/listenting", _set_phase("listening"))
-    dispatcher.map("/state/thanks", _set_phase("thanks"))
 
-    dispatcher.map("/viz/mod/hue", _mod_hue)
-    dispatcher.map("/viz/mod/energy", _mod_energy)
+    # Phase transitions.
+    dispatcher.map("/state/idle",       _set_phase("idle"))
+    dispatcher.map("/state/talking",    _set_phase("talking"))
+    dispatcher.map("/state/listening",  _set_phase("listening"))
+    dispatcher.map("/state/listenting", _set_phase("listenting"))
+    dispatcher.map("/state/thanks",     _set_phase("thanks"))
+
+    # Continuous modulation.
+    dispatcher.map("/viz/mod/hue",     _mod_hue)
+    dispatcher.map("/viz/mod/energy",  _mod_energy)
     dispatcher.map("/viz/audio/pulse", _audio_pulse)
-    dispatcher.map("/frozen/fan", _frozen_fan)
-    dispatcher.map("/frozen/hue", _frozen_hue)
-    dispatcher.map("/frozen/light", _frozen_light)
+    dispatcher.map("/frozen/hue",      _frozen_hue)
+    dispatcher.map("/frozen/light",    _frozen_light)
+    dispatcher.map("/frozen/fan",      _frozen_fan)
 
+    # Musical cues.
     dispatcher.map("/cue/snare", _cue_snare)
-    dispatcher.map("/cue/hit", _cue_hit)
-    dispatcher.map("/cue/note", _cue_note)
+    dispatcher.map("/cue/hit",   _cue_hit)
+    dispatcher.map("/cue/note",  _cue_note)
+    dispatcher.map("/cue/bar",   _cue_bar)
 
     loop = asyncio.get_event_loop()
-    server = AsyncIOOSCUDPServer(("127.0.0.1", 9001), dispatcher, loop)
+    server = AsyncIOOSCUDPServer((OSC_HOST, OSC_PORT), dispatcher, loop)
     transport, _ = await server.create_serve_endpoint()
+    print(f"[viz] OSC server listening on {OSC_HOST}:{OSC_PORT}")
+
     try:
         if _HAS_PYGAME:
             try:
                 await _run_pygame_renderer()
             except Exception as exc:
-                print(f"[viz] Not using pygame due to runtime error: {exc}")
+                print(f"[viz] pygame runtime error, falling back to console: {exc}")
                 await _run_console_renderer()
         else:
             await _run_console_renderer()

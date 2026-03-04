@@ -40,6 +40,8 @@ class Controller:
         while True:
             pots = self.hw.read_pots()
             self.hw.apply_idle_controls(pots)
+            # Mirror live idle knob changes to OSC so visualizer can react immediately.
+            self.osc.frozen(fan=pots.fan, hue=pots.hue, light=pots.light)
 
             self._emit_touch_pulses()
 
@@ -61,6 +63,7 @@ class Controller:
     async def _run_talking(self) -> None:
         self.state = State.TALKING
         self.osc.state(self.state.value)
+        self.osc.frozen(fan=self.frozen.fan, hue=self.frozen.hue, light=self.frozen.light)
         print("[controller] state=talking")
         self.hw.apply_frozen_controls(self.frozen)
         end_at = time.monotonic() + TIMING.talking_seconds
@@ -70,6 +73,7 @@ class Controller:
     async def _run_listening(self) -> None:
         self.state = State.LISTENING
         self.osc.state(self.state.value)
+        self.osc.frozen(fan=self.frozen.fan, hue=self.frozen.hue, light=self.frozen.light)
         print("[controller] state=listening")
 
         rate = 1.0 / RATES.listening_param_hz
@@ -95,6 +99,7 @@ class Controller:
     async def _run_thanks(self) -> None:
         self.state = State.THANKS
         self.osc.state(self.state.value)
+        self.osc.frozen(fan=self.frozen.fan, hue=self.frozen.hue, light=self.frozen.light)
         print("[controller] state=thanks")
         end_at = time.monotonic() + TIMING.thanks_seconds
         while time.monotonic() < end_at:
